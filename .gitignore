@@ -1,0 +1,14 @@
+# Build output
+/bin/
+/mdns-asset-scanner
+/mdns-asset-scanner.exe
+
+# Test and coverage output
+*.test
+coverage.out
+
+# Local editor and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
