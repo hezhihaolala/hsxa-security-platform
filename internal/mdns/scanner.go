@@ -2,6 +2,7 @@ package mdns
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -225,19 +226,20 @@ func (s *Scanner) runPhase(parent context.Context, conn *net.UDPConn, packets []
 	}
 
 	responses := make(chan response, 256)
-	readDone := make(chan struct{})
+	readResult := make(chan error, 1)
 	go func() {
-		defer close(readDone)
 		buffer := make([]byte, 65535)
 		for {
 			n, source, err := conn.ReadFromUDP(buffer)
 			if err != nil {
+				readResult <- err
 				return
 			}
 			packet := append([]byte(nil), buffer[:n]...)
 			select {
 			case responses <- response{packet: packet, source: source.IP}:
 			case <-phaseCtx.Done():
+				readResult <- nil
 				return
 			}
 		}
@@ -257,23 +259,35 @@ func (s *Scanner) runPhase(parent context.Context, conn *net.UDPConn, packets []
 		select {
 		case item := <-responses:
 			s.consumeResponse(item, aggregator, sources)
-		case <-readDone:
+		case readErr := <-readResult:
 			cancel()
+			if err := conn.SetWriteDeadline(time.Now()); err != nil {
+				s.logger.Printf("wake UDP writers: %v", err)
+			}
 			<-sendDone
+		drainResponses:
 			for {
 				select {
 				case item := <-responses:
 					s.consumeResponse(item, aggregator, sources)
 				default:
-					return sourceValues(sources), nil
+					break drainResponses
 				}
 			}
+			var netErr net.Error
+			if readErr != nil && (!errors.As(readErr, &netErr) || !netErr.Timeout() || phaseCtx.Err() == nil) {
+				return nil, fmt.Errorf("read UDP response: %w", readErr)
+			}
+			return sourceValues(sources), nil
 		case <-parent.Done():
 			cancel()
 			if err := conn.SetReadDeadline(time.Now()); err != nil {
 				s.logger.Printf("wake UDP reader: %v", err)
 			}
-			<-readDone
+			if err := conn.SetWriteDeadline(time.Now()); err != nil {
+				s.logger.Printf("wake UDP writers: %v", err)
+			}
+			<-readResult
 			<-sendDone
 			if parent.Err() == context.DeadlineExceeded {
 				return sourceValues(sources), nil
@@ -282,12 +296,18 @@ func (s *Scanner) runPhase(parent context.Context, conn *net.UDPConn, packets []
 		}
 	}
 }
+
 func (s *Scanner) consumeResponse(item response, aggregator *Aggregator, sources map[string]net.IP) {
-	if err := aggregator.AddPacket(item.packet, item.source); err != nil {
-		s.logger.Printf("ignored malformed packet from %s: %v", item.source, err)
+	source := item.source.To4()
+	if source == nil || !s.network.Contains(source) {
+		s.logger.Printf("ignored response outside CIDR from %s", item.source)
 		return
 	}
-	sources[item.source.String()] = append(net.IP(nil), item.source...)
+	if err := aggregator.AddPacket(item.packet, source); err != nil {
+		s.logger.Printf("ignored malformed packet from %s: %v", source, err)
+		return
+	}
+	sources[source.String()] = append(net.IP(nil), source...)
 }
 
 type sendJob struct {

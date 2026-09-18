@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -23,12 +27,18 @@ func main() {
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	flags := flag.NewFlagSet("mdns-asset-scanner", flag.ContinueOnError)
-	flags.SetOutput(stderr)
+	flags.SetOutput(io.Discard)
 	cidr := flags.String("cidr", "", "authorized IPv4 CIDR to probe (required)")
 	portValue := flags.String("ports", "1-65535", "SRV ports to include, e.g. 80,443,5000-5010")
 	timeout := flags.Duration("timeout", 3*time.Second, "overall discovery timeout")
 	concurrency := flags.Int("concurrency", 64, "maximum concurrent UDP send workers (1-1024)")
 	jsonOutput := flags.Bool("json", false, "emit JSON instead of text")
+	flags.Usage = func() {
+		fmt.Fprintln(stdout, "Usage: mdns-asset-scanner [options]")
+		flags.SetOutput(stdout)
+		flags.PrintDefaults()
+		flags.SetOutput(io.Discard)
+	}
 	verbose := flags.Bool("verbose", false, "write diagnostic messages to stderr")
 	if err := flags.Parse(args); err != nil {
 		return err

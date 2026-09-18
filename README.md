@@ -10,7 +10,7 @@ authentication, or modify remote systems.
 
 ## Build and test
 
-Go 1.24 or newer is recommended.
+Go 1.24 or newer is required.
 
 ```bash
 go mod download
@@ -71,6 +71,9 @@ The scanner sends a standard multicast query to `224.0.0.251:5353`. It also
 sends mDNS queries directly to addresses in the authorized IPv4 CIDR through a
 bounded worker pool. Queries request unicast replies so the scanner can use an
 ephemeral local UDP port without taking exclusive ownership of port 5353.
+The multicast query is visible to the whole local link by protocol design, but
+responses and follow-up unicast queries are restricted to the requested CIDR.
+
 
 Unknown and vendor-specific service types are retained. TXT strings are kept
 verbatim in `raw_banner`/`txt`; a stable, sorted `banner` and parsed

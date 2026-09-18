@@ -1,6 +1,8 @@
 package mdns
 
 import (
+	"bytes"
+	"encoding/json"
 	"net"
 	"reflect"
 	"strings"
@@ -68,6 +70,7 @@ func TestAggregatorJoinsDNSServiceRecords(t *testing.T) {
 		t.Errorf("IP = %q; want 192.168.1.10", qdiscover.IP)
 	}
 	if !reflect.DeepEqual(qdiscover.RawBanner, []string{
+		"MODEL=ignored",
 		"accessPort=86",
 		"accessType=https",
 		"displayModel=TS-464C",
@@ -80,6 +83,9 @@ func TestAggregatorJoinsDNSServiceRecords(t *testing.T) {
 	}
 	if qdiscover.StructuredBanner["displayModel"] != "TS-464C" || qdiscover.StructuredBanner["flagOnly"] != "" {
 		t.Errorf("structured banner = %#v", qdiscover.StructuredBanner)
+	}
+	if qdiscover.StructuredBanner["model"] != "TS-X64" {
+		t.Errorf("case-insensitive duplicate TXT replaced first value: %#v", qdiscover.StructuredBanner)
 	}
 	if !strings.Contains(qdiscover.Banner, "accessType=https") || !strings.Contains(qdiscover.Banner, "fwBuildNum=20260214") {
 		t.Errorf("banner lost TXT data: %q", qdiscover.Banner)
@@ -135,6 +141,89 @@ func TestWriteTextIsStableAndComplete(t *testing.T) {
 	}
 }
 
+func TestAggregatorGoodbyeRemovesService(t *testing.T) {
+	aggregator := NewAggregator()
+	aggregator.AddMessage(fixtureMessage(t), net.ParseIP("192.168.1.10"))
+	ports, _ := ParsePorts("86")
+	_, network, _ := net.ParseCIDR("192.168.1.0/24")
+	if got := aggregator.Assets(ports, network); len(got) != 1 {
+		t.Fatalf("assets before goodbye = %d; want 1", len(got))
+	}
+
+	goodbye := &dns.Msg{Answer: []dns.RR{&dns.PTR{
+		Hdr: rrHeader("_qdiscover._tcp.local.", dns.TypePTR, 0),
+		Ptr: "NAS._qdiscover._tcp.local.",
+	}}}
+	aggregator.AddMessage(goodbye, net.ParseIP("192.168.1.10"))
+	if got := aggregator.Assets(ports, network); len(got) != 0 {
+		t.Fatalf("assets after goodbye = %+v; want none", got)
+	}
+}
+
+func TestAggregatorDoesNotBindOutsideTargetToResponder(t *testing.T) {
+	msg := &dns.Msg{
+		Answer: []dns.RR{
+			&dns.PTR{Hdr: rrHeader("_outside._tcp.local.", dns.TypePTR, 120), Ptr: "Device._outside._tcp.local."},
+		},
+		Extra: []dns.RR{
+			&dns.SRV{Hdr: rrHeader("Device._outside._tcp.local.", dns.TypeSRV, 120), Port: 8080, Target: "outside.local."},
+			&dns.A{Hdr: rrHeader("outside.local.", dns.TypeA, 120), A: net.ParseIP("203.0.113.5")},
+		},
+	}
+	aggregator := NewAggregator()
+	aggregator.AddMessage(msg, net.ParseIP("192.168.1.10"))
+	ports, _ := ParsePorts("8080")
+	_, network, _ := net.ParseCIDR("192.168.1.0/24")
+	if got := aggregator.Assets(ports, network); len(got) != 0 {
+		t.Fatalf("out-of-CIDR target was attributed to responder: %+v", got)
+	}
+}
+
+func TestAggregatorJoinsRecordsAcrossPacketsAndOrder(t *testing.T) {
+	aggregator := NewAggregator()
+	source := net.ParseIP("192.168.1.20")
+	records := []dns.RR{
+		&dns.A{Hdr: rrHeader("ordered.local.", dns.TypeA, 120), A: source},
+		&dns.TXT{Hdr: rrHeader("Device._custom._tcp.local.", dns.TypeTXT, 120), Txt: []string{"path=/first", "PATH=/ignored"}},
+		&dns.SRV{Hdr: rrHeader("Device._custom._tcp.local.", dns.TypeSRV, 120), Port: 8080, Target: "ordered.local."},
+		&dns.PTR{Hdr: rrHeader("_custom._tcp.local.", dns.TypePTR, 120), Ptr: "Device._custom._tcp.local."},
+	}
+	for _, record := range records {
+		aggregator.AddMessage(&dns.Msg{Answer: []dns.RR{record}}, source)
+	}
+	ports, _ := ParsePorts("8080")
+	_, network, _ := net.ParseCIDR("192.168.1.0/24")
+	assets := aggregator.Assets(ports, network)
+	if len(assets) != 1 {
+		t.Fatalf("got %d assets; want 1", len(assets))
+	}
+	if assets[0].StructuredBanner["path"] != "/first" {
+		t.Errorf("case-insensitive duplicate TXT did not keep first value: %#v", assets[0].StructuredBanner)
+	}
+	if _, exists := assets[0].StructuredBanner["PATH"]; exists {
+		t.Errorf("duplicate TXT key should not be emitted twice: %#v", assets[0].StructuredBanner)
+	}
+}
+
+func TestWriteJSON(t *testing.T) {
+	aggregator := NewAggregator()
+	aggregator.AddMessage(fixtureMessage(t), net.ParseIP("192.168.1.10"))
+	ports, _ := ParsePorts("86")
+	_, network, _ := net.ParseCIDR("192.168.1.0/24")
+
+	var output bytes.Buffer
+	if err := WriteJSON(&output, aggregator.Assets(ports, network)); err != nil {
+		t.Fatalf("WriteJSON() error = %v", err)
+	}
+	var assets []Asset
+	if err := json.Unmarshal(output.Bytes(), &assets); err != nil {
+		t.Fatalf("JSON output is invalid: %v", err)
+	}
+	if len(assets) != 1 || assets[0].StructuredBanner["model"] != "TS-X64" {
+		t.Fatalf("unexpected JSON assets: %+v", assets)
+	}
+}
+
 func fixtureMessage(t *testing.T) *dns.Msg {
 	t.Helper()
 	msg := new(dns.Msg)
@@ -172,6 +261,7 @@ func fixtureMessage(t *testing.T) *dns.Msg {
 			"displayModel=TS-464C",
 			"accessPort=86",
 			"fwVer=5.2.9",
+			"MODEL=ignored",
 			"flagOnly",
 		}},
 	)

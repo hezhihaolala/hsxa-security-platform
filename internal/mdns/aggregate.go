@@ -16,26 +16,33 @@ type srvRecord struct {
 	port   uint16
 }
 
+type txtValue struct {
+	key   string
+	value string
+}
+
 // Aggregator joins PTR, SRV, TXT, A, and AAAA records regardless of RR order.
 type Aggregator struct {
-	serviceTypes map[string]string
-	instances    map[string]string
-	srv          map[string]map[string]srvRecord
-	txt          map[string]map[string]struct{}
-	addresses    map[string]map[string]Address
-	ttl          map[string]uint32
-	sources      map[string]map[string]struct{}
+	serviceTypes  map[string]string
+	instances     map[string]string
+	srv           map[string]map[string]srvRecord
+	txt           map[string]map[string]struct{}
+	addresses     map[string]map[string]Address
+	structuredTXT map[string]map[string]txtValue
+	ttl           map[string]uint32
+	sources       map[string]map[string]struct{}
 }
 
 func NewAggregator() *Aggregator {
 	return &Aggregator{
-		serviceTypes: make(map[string]string),
-		instances:    make(map[string]string),
-		srv:          make(map[string]map[string]srvRecord),
-		txt:          make(map[string]map[string]struct{}),
-		addresses:    make(map[string]map[string]Address),
-		ttl:          make(map[string]uint32),
-		sources:      make(map[string]map[string]struct{}),
+		serviceTypes:  make(map[string]string),
+		instances:     make(map[string]string),
+		srv:           make(map[string]map[string]srvRecord),
+		txt:           make(map[string]map[string]struct{}),
+		addresses:     make(map[string]map[string]Address),
+		structuredTXT: make(map[string]map[string]txtValue),
+		ttl:           make(map[string]uint32),
+		sources:       make(map[string]map[string]struct{}),
 	}
 }
 
@@ -61,6 +68,10 @@ func (a *Aggregator) AddMessage(msg *dns.Msg, source net.IP) {
 		header := rr.Header()
 		owner := canonical(header.Name)
 		a.rememberTTL(owner, header.Ttl)
+		if header.Ttl == 0 {
+			a.removeRecord(rr)
+			continue
+		}
 
 		switch record := rr.(type) {
 		case *dns.PTR:
@@ -86,8 +97,16 @@ func (a *Aggregator) AddMessage(msg *dns.Msg, source net.IP) {
 			if a.txt[owner] == nil {
 				a.txt[owner] = make(map[string]struct{})
 			}
+			if a.structuredTXT[owner] == nil {
+				a.structuredTXT[owner] = make(map[string]txtValue)
+			}
 			for _, value := range record.Txt {
 				a.txt[owner][value] = struct{}{}
+				key, item, _ := strings.Cut(value, "=")
+				canonicalKey := strings.ToLower(key)
+				if _, exists := a.structuredTXT[owner][canonicalKey]; !exists {
+					a.structuredTXT[owner][canonicalKey] = txtValue{key: key, value: item}
+				}
 			}
 			messageInstances[owner] = struct{}{}
 		case *dns.A:
@@ -105,6 +124,30 @@ func (a *Aggregator) AddMessage(msg *dns.Msg, source net.IP) {
 			a.sources[instance] = make(map[string]struct{})
 		}
 		a.sources[instance][source.String()] = struct{}{}
+	}
+}
+
+func (a *Aggregator) removeRecord(rr dns.RR) {
+	owner := canonical(rr.Header().Name)
+	switch record := rr.(type) {
+	case *dns.PTR:
+		target := canonical(record.Ptr)
+		if owner == canonical(serviceEnumerationName) {
+			delete(a.serviceTypes, target)
+			return
+		}
+		delete(a.instances, target)
+		delete(a.sources, target)
+	case *dns.SRV:
+		key := fmt.Sprintf("%s:%d", canonical(record.Target), record.Port)
+		delete(a.srv[owner], key)
+	case *dns.TXT:
+		delete(a.txt, owner)
+		delete(a.structuredTXT, owner)
+	case *dns.A:
+		delete(a.addresses[owner], "IPv4:"+record.A.String())
+	case *dns.AAAA:
+		delete(a.addresses[owner], "IPv6:"+record.AAAA.String())
 	}
 }
 
@@ -183,14 +226,9 @@ func (a *Aggregator) Assets(ports PortSet, network *net.IPNet) []Asset {
 			seen[key] = struct{}{}
 
 			raw := sortedKeys(a.txt[instanceKey])
-			structured := make(map[string]string, len(raw))
-			for _, value := range raw {
-				key, item, found := strings.Cut(value, "=")
-				if found {
-					structured[key] = item
-				} else {
-					structured[value] = ""
-				}
+			structured := make(map[string]string, len(a.structuredTXT[instanceKey]))
+			for _, value := range a.structuredTXT[instanceKey] {
+				structured[value.key] = value.value
 			}
 
 			assets = append(assets, Asset{
@@ -220,8 +258,10 @@ func (a *Aggregator) Assets(ports PortSet, network *net.IPNet) []Asset {
 func (a *Aggregator) assetAddresses(instance, target string, network *net.IPNet) []Address {
 	values := make(map[string]Address)
 	matchedCIDR := network == nil
+	hasExplicitIPv4 := false
 	for key, address := range a.addresses[target] {
 		if address.Family == "IPv4" {
+			hasExplicitIPv4 = true
 			ip := net.ParseIP(address.IP)
 			if network != nil && !network.Contains(ip) {
 				continue
@@ -230,11 +270,13 @@ func (a *Aggregator) assetAddresses(instance, target string, network *net.IPNet)
 		}
 		values[key] = address
 	}
-	for source := range a.sources[instance] {
-		ip := net.ParseIP(source)
-		if ip != nil && ip.To4() != nil && (network == nil || network.Contains(ip)) {
-			values["IPv4:"+source] = Address{IP: source, Family: "IPv4"}
-			matchedCIDR = true
+	if !hasExplicitIPv4 {
+		for source := range a.sources[instance] {
+			ip := net.ParseIP(source)
+			if ip != nil && ip.To4() != nil && (network == nil || network.Contains(ip)) {
+				values["IPv4:"+source] = Address{IP: source, Family: "IPv4"}
+				matchedCIDR = true
+			}
 		}
 	}
 	if !matchedCIDR {
